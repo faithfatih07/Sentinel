@@ -1,0 +1,11 @@
+
+from rapidfuzz import fuzz
+
+ad_1 = "Start investing with BrokerX today! Earn up to 15% annually."
+
+ad_2 = "Start investing with BrokerX now! Earn up to 15% annually."
+
+# Compare the two advertisements
+score = fuzz.ratio(ad_1, ad_2)
+
+print(f"Similarity: {score}%")

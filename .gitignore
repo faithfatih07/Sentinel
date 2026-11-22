@@ -1,0 +1,63 @@
+# Local credentials and private configuration
+.env
+.env.*
+!.env.example
+**/credentials*
+**/secrets*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local databases, WAL files, and database backups
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+/backups/
+/sentinel_pre_*.db
+
+# Local model weights and generated model files
+/sentinel_models/
+*.bin
+*.ggml
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
+
+# Local evidence and test media
+/sentinel_video_test/
+**/asr_runs/
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+*.srt
+*.vtt
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# Generated reports, logs, caches, and temporary files
+/outputs/
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+*.swo
+*.bak
+*.backup
+*.before_*
