@@ -4,9 +4,9 @@ import socket
 from dataclasses import replace
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
-from pattern_discovery_providers import ProviderConfigurationError, ProviderConfig, ProviderRequestError, resolve_api_key
+from pattern_discovery_providers import ProviderConfigurationError, ProviderConfig, ProviderRequestError, resolve_api_key, verified_urlopen
 
 
 DEFAULT_ENDPOINT = "https://api.openai.com/v1/responses"
@@ -29,7 +29,7 @@ class OpenAIResponsesProvider:
         self._api_key = resolve_api_key(key_config, environ)
         if not self._api_key:
             raise ProviderConfigurationError("OPENAI_API_KEY is unset")
-        self._opener = opener or urlopen
+        self._opener = opener or verified_urlopen
 
     def generate(self, request):
         evidence_payload = json.dumps(request, ensure_ascii=False, separators=(",", ":"))

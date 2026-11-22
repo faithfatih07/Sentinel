@@ -116,7 +116,11 @@ def run_ai_discovery(db_path=DB, provider=None, config=None, environ=None):
         if isinstance(response, str) and len(response.encode("utf-8")) > 2_000_000:
             raise ValueError("provider response exceeds the 2 MB limit")
         result = import_ai_suggestions(response, db_path, run_metadata=metadata, existing_run_id=run_id)
-        return {**result, "provider": config.provider, "model": config.model}
+        output = {**result, "provider": config.provider, "model": config.model}
+        usage = getattr(adapter, "usage", None)
+        if isinstance(usage, dict):
+            output["provider_usage"] = dict(usage)
+        return output
     except Exception as error:
         conn = _connect(db_path)
         if isinstance(error, ProviderRequestError):

@@ -566,11 +566,11 @@ def main():
     elif args.command=="import-ai": result=import_ai_suggestions(args.path)
     elif args.command=="ai":
         from pattern_discovery_ai import run_ai_discovery
-        from pattern_discovery_providers import ProviderConfigurationError
+        from pattern_discovery_providers import ProviderConfigurationError, ProviderRequestError
         try:
             result=run_ai_discovery()
-        except ProviderConfigurationError as error:
-            parser.exit(2,f"AI discovery unavailable: {error}\n")
+        except (ProviderConfigurationError,ProviderRequestError,ValueError) as error:
+            parser.exit(2,f"AI discovery failed: {error}\n")
     elif args.command=="list": result=list_candidates(status=args.status,include_history=args.all)
     elif args.command=="show": result=get_candidate(args.candidate_id)
     else: result=review_candidate(args.candidate_id,args.decision,args.reviewer,args.note,allow_near_duplicate=args.allow_near_duplicate)

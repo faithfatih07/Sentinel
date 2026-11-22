@@ -4,8 +4,11 @@ import sqlite3
 import tempfile
 import unittest
 from io import BytesIO
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from urllib.error import HTTPError
+from unittest.mock import patch
 
 from evidence_processing import apply_migrations
 from pattern_discovery import export_ai_bundle, get_candidate, import_ai_suggestions, list_candidates, review_candidate, run_local_discovery
@@ -13,6 +16,7 @@ from pattern_discovery import WORD_RE
 from pattern_discovery_ai import build_ai_request, run_ai_discovery
 from pattern_discovery_providers import ProviderConfig, ProviderConfigurationError, ProviderRequestError, load_provider
 from pattern_discovery_openai import OpenAIResponsesProvider
+from pattern_discovery_gemini import GeminiGenerateContentProvider
 
 PROJECT=Path(__file__).resolve().parent
 
@@ -293,6 +297,115 @@ class PatternDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProviderConfigurationError,'requires OPENAI_API_KEY'):
             ProviderConfig.from_environment({'SENTINEL_DISCOVERY_PROVIDER':'openai','SENTINEL_DISCOVERY_MODEL':'test-model',
                 'SENTINEL_DISCOVERY_API_KEY_ENV':'OTHER_SECRET'})
+
+    def test_gemini_inference_verifies_model_and_persists_valid_pending_candidate(self):
+        request_data=[]
+        valid_response=json.dumps(self.mock_response(build_ai_request(self.db)))
+        responses=[
+            {'models':[{'name':'models/test-gemini','baseModelId':'test-gemini',
+                'supportedGenerationMethods':['generateContent']} ]},
+            {'candidates':[{'finishReason':'STOP','content':{'parts':[{'text':valid_response}]}}],
+             'usageMetadata':{'promptTokenCount':1200,'candidatesTokenCount':90,'totalTokenCount':1290}},
+        ]
+        def opener(req,timeout):
+            request_data.append((req,timeout))
+            return BytesIO(json.dumps(responses.pop(0)).encode('utf-8'))
+        config=ProviderConfig(provider='gemini',model='test-gemini',timeout_seconds=9,api_key_env='GEMINI_API_KEY')
+        provider=GeminiGenerateContentProvider(config,environ={'GEMINI_API_KEY':'test-gemini-secret'},opener=opener)
+        result=run_ai_discovery(self.db,provider,config)
+        self.assertEqual(result['provider'],'gemini')
+        self.assertEqual(result['model'],'test-gemini')
+        self.assertEqual(result['imported'],1)
+        self.assertEqual(result['provider_usage'],{'promptTokenCount':1200,'candidatesTokenCount':90,'totalTokenCount':1290})
+        self.assertEqual(len(request_data),2)
+        self.assertEqual(request_data[0][0].get_method(),'GET')
+        self.assertIn('/models?',request_data[0][0].full_url)
+        self.assertEqual(request_data[1][0].get_method(),'POST')
+        self.assertTrue(request_data[1][0].full_url.endswith('/models/test-gemini:generateContent'))
+        for req,timeout in request_data:
+            self.assertEqual(timeout,9)
+            self.assertNotIn('test-gemini-secret',req.full_url)
+            self.assertIn('test-gemini-secret',req.get_header('X-goog-api-key'))
+        payload=json.loads(request_data[1][0].data.decode('utf-8'))
+        self.assertEqual(payload['generationConfig']['responseMimeType'],'application/json')
+        self.assertEqual(payload['generationConfig']['responseJsonSchema'],build_ai_request(self.db)['response_schema'])
+        sent=json.loads(payload['contents'][0]['parts'][0]['text'])
+        expected=build_ai_request(self.db)
+        self.assertEqual(sent['selected_evidence'],expected['selected_evidence'])
+        self.assertEqual(sent['approved_pattern_library'],expected['approved_pattern_library'])
+        self.assertNotIn('test-gemini-secret',json.dumps(payload))
+        c=self.connect()
+        candidate=c.execute("SELECT discovery_status,proposed_by FROM pattern_discovery_candidates WHERE proposed_by='ai_assisted'").fetchone()
+        self.assertEqual(tuple(candidate),('pending_review','ai_assisted'))
+        self.assertEqual(c.execute('SELECT status FROM pattern_discovery_runs WHERE run_id=?',(result['run_id'],)).fetchone()[0],'completed')
+        c.close()
+
+    def test_gemini_rejects_unavailable_model_before_inference(self):
+        calls=[]
+        provider=GeminiGenerateContentProvider(
+            ProviderConfig(provider='gemini',model='missing-model',api_key_env='GEMINI_API_KEY'),
+            environ={'GEMINI_API_KEY':'fixture'},
+            opener=lambda req,timeout: (calls.append(req) or BytesIO(json.dumps({'models':[
+                {'name':'models/other-model','supportedGenerationMethods':['generateContent']}]}).encode('utf-8'))),
+        )
+        with self.assertRaisesRegex(ProviderConfigurationError,'not available'):
+            run_ai_discovery(self.db,provider,provider.config)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0].get_method(),'GET')
+        c=self.connect()
+        run=c.execute('SELECT status,error_text FROM pattern_discovery_runs ORDER BY rowid DESC LIMIT 1').fetchone()
+        self.assertEqual(run['status'],'failed')
+        self.assertIn('missing-model',run['error_text'])
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM pattern_discovery_candidates WHERE proposed_by='ai_assisted'").fetchone()[0],0)
+        c.close()
+
+    def test_ai_cli_reports_provider_errors_without_traceback(self):
+        from pattern_discovery import main
+        stderr=StringIO()
+        with patch('sys.argv',['pattern_discovery.py','ai']), \
+                patch('pattern_discovery_ai.run_ai_discovery',side_effect=ProviderRequestError('Gemini model access denied (HTTP 404)')):
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                main()
+        self.assertEqual(raised.exception.code,2)
+        self.assertIn('Gemini model access denied',stderr.getvalue())
+        self.assertNotIn('Traceback',stderr.getvalue())
+
+    def test_gemini_handles_invalid_key_rate_limit_timeout_and_malformed_response(self):
+        config=ProviderConfig(provider='gemini',model='test-gemini',api_key_env='GEMINI_API_KEY')
+        def provider_for(opener):
+            return GeminiGenerateContentProvider(config,environ={'GEMINI_API_KEY':'fixture-secret'},opener=opener)
+        def http_error(code,body):
+            def opener(req,timeout):
+                raise HTTPError(req.full_url,code,'provider failure',{},BytesIO(body))
+            return opener
+        invalid=provider_for(http_error(400,b'{"error":{"status":"INVALID_ARGUMENT","message":"API key not valid. fixture-secret"}}'))
+        with self.assertRaisesRegex(ProviderRequestError,'API key is invalid') as error:
+            invalid.generate(build_ai_request(self.db))
+        self.assertNotIn('fixture-secret',str(error.exception))
+        limited=provider_for(http_error(429,b'{"error":{"status":"RESOURCE_EXHAUSTED"}}'))
+        with self.assertRaisesRegex(ProviderRequestError,'rate limit or quota'):
+            limited.generate(build_ai_request(self.db))
+        timed_out=provider_for(lambda req,timeout: (_ for _ in ()).throw(TimeoutError()))
+        with self.assertRaisesRegex(ProviderRequestError,'timed out'):
+            timed_out.generate(build_ai_request(self.db))
+        malformed=provider_for(lambda req,timeout: BytesIO(b'not-json'))
+        with self.assertRaisesRegex(ProviderRequestError,'malformed JSON'):
+            malformed.generate(build_ai_request(self.db))
+        model_unavailable=provider_for(http_error(404,b'{"error":{"status":"NOT_FOUND","message":"models/test-gemini is not found for API version v1beta, or is not supported for generateContent"}}'))
+        with self.assertRaisesRegex(ProviderRequestError,'listed but is unavailable or unsupported'):
+            model_unavailable.generate(build_ai_request(self.db))
+
+    def test_gemini_configuration_reads_provider_and_key_from_project_env_file(self):
+        from pattern_discovery_providers import project_environment
+        env_path=Path(self.temp.name)/'.env'
+        env_path.write_text('GEMINI_API_KEY=fixture-only\nSENTINEL_DISCOVERY_PROVIDER=gemini\nSENTINEL_DISCOVERY_MODEL=fixture-model\n',encoding='utf-8')
+        config=ProviderConfig.from_environment(project_environment(environ={},dotenv_path=env_path))
+        self.assertEqual(config.api_key_env,'GEMINI_API_KEY')
+        self.assertEqual(config.provider,'gemini')
+        self.assertEqual(project_environment({'GEMINI_API_KEY':'fixture-only'})['GEMINI_API_KEY'],'fixture-only')
+        with self.assertRaisesRegex(ProviderConfigurationError,'requires GEMINI_API_KEY'):
+            ProviderConfig.from_environment({'SENTINEL_DISCOVERY_PROVIDER':'gemini',
+                'SENTINEL_DISCOVERY_MODEL':'fixture-model','SENTINEL_DISCOVERY_API_KEY_ENV':'OTHER_KEY'})
 
     def test_missing_openai_key_is_audited_without_attempting_inference(self):
         config=ProviderConfig(provider='openai',model='test-model',api_key_env='OPENAI_API_KEY')
