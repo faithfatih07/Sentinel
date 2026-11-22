@@ -335,7 +335,7 @@ def get_candidate(candidate_id, db_path=DB):
     return next((row for row in rows if row["candidate_id"]==candidate_id),None)
 
 
-def import_ai_suggestions(suggestions, db_path=DB, run_metadata=None):
+def import_ai_suggestions(suggestions, db_path=DB, run_metadata=None, existing_run_id=None):
     """Validate citations against current selected evidence, then persist suggestions separately."""
     if isinstance(suggestions,(str,Path)):
         if isinstance(suggestions,Path):
@@ -366,7 +366,7 @@ def import_ai_suggestions(suggestions, db_path=DB, run_metadata=None):
         for proposal in proposals:
             if not isinstance(proposal,dict):
                 raise ValueError("Each proposal must be an object")
-            required=("candidate_name","candidate_category","supporting_evidence","reasoning","confidence","confidence_basis","novelty_type")
+            required=("candidate_name","candidate_category","supporting_evidence","reasoning","confidence","confidence_basis","novelty_type","target_pattern_id")
             missing=[key for key in required if key not in proposal]
             if missing:
                 raise ValueError("AI proposal is missing required fields: "+", ".join(missing))
@@ -419,7 +419,14 @@ def import_ai_suggestions(suggestions, db_path=DB, run_metadata=None):
     except Exception:
         conn.close()
         raise
-    run_id=_start_run(conn,len(active),"ai_assisted")
+    if existing_run_id:
+        run=conn.execute("SELECT status FROM pattern_discovery_runs WHERE run_id=?",(existing_run_id,)).fetchone()
+        if not run or run["status"]!="running":
+            conn.close()
+            raise ValueError("AI discovery run is missing or no longer running")
+        run_id=existing_run_id
+    else:
+        run_id=_start_run(conn,len(active),"ai_assisted")
     try:
         metadata={"provider":"offline_import","model":None}
         if isinstance(run_metadata,dict):

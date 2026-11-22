@@ -1,9 +1,4 @@
-"""Provider-neutral extension point for pattern-discovery LLM adapters.
-
-Sentinel intentionally ships no provider adapter. Integrators install an
-adapter exposing the ``sentinel.pattern_discovery_providers`` entry-point
-group; tests inject a mock implementation directly.
-"""
+"""Provider-neutral extension point for pattern-discovery LLM adapters."""
 from dataclasses import dataclass
 from importlib.metadata import entry_points
 from typing import Any, Mapping, Protocol, runtime_checkable
@@ -17,6 +12,14 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 class ProviderConfigurationError(RuntimeError):
     pass
+
+
+class ProviderRequestError(RuntimeError):
+    """Sanitized provider request failure safe to persist in run audit data."""
+
+    def __init__(self, safe_message):
+        super().__init__(safe_message)
+        self.safe_message = safe_message
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,10 @@ class ProviderConfig:
                 raise ProviderConfigurationError("SENTINEL_DISCOVERY_PROVIDER must be an adapter entry-point name")
             if not model:
                 raise ProviderConfigurationError("SENTINEL_DISCOVERY_MODEL is required when a provider is enabled")
+        if provider.lower() == "openai":
+            if api_key_env not in (None, "OPENAI_API_KEY"):
+                raise ProviderConfigurationError("The OpenAI adapter requires OPENAI_API_KEY")
+            api_key_env = "OPENAI_API_KEY"
         if api_key_env and not _IDENTIFIER.fullmatch(api_key_env):
             raise ProviderConfigurationError("SENTINEL_DISCOVERY_API_KEY_ENV must name an environment variable")
         return cls(provider=provider, model=model, endpoint=endpoint, api_key_env=api_key_env, timeout_seconds=timeout)
@@ -73,14 +80,20 @@ def load_provider(config: ProviderConfig | None = None, environ=None):
     config = config or ProviderConfig.from_environment(environ)
     if config.provider.lower() == "disabled":
         raise ProviderConfigurationError("AI discovery is disabled; set SENTINEL_DISCOVERY_PROVIDER to an installed adapter")
-    matches = [entry for entry in entry_points(group=ENTRY_POINT_GROUP) if entry.name == config.provider]
-    if not matches:
-        raise ProviderConfigurationError(
-            f"No installed discovery adapter named {config.provider!r}; install an adapter exposing {ENTRY_POINT_GROUP}"
-        )
     try:
-        factory = matches[0].load()
-        provider = factory(config)
+        matches = [entry for entry in entry_points(group=ENTRY_POINT_GROUP) if entry.name == config.provider]
+        if matches:
+            factory = matches[0].load()
+        elif config.provider.lower() == "openai":
+            from pattern_discovery_openai import OpenAIResponsesProvider
+            provider = OpenAIResponsesProvider(config, environ=environ)
+            factory = None
+        else:
+            raise ProviderConfigurationError(
+                f"No installed discovery adapter named {config.provider!r}; install an adapter exposing {ENTRY_POINT_GROUP}"
+            )
+        if factory is not None:
+            provider = factory(config)
     except ProviderConfigurationError:
         raise
     except Exception as exc:

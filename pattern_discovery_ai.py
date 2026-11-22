@@ -1,30 +1,53 @@
-"""Provider-neutral AI-assisted discovery orchestration.
+"""Provider-neutral AI-assisted discovery orchestration."""
+import json
+from pattern_discovery import DB, import_ai_suggestions, selected_evidence, _connect, _start_run
+from pattern_discovery_providers import ProviderConfig, ProviderConfigurationError, ProviderRequestError, load_provider
 
-No LLM provider or network dependency is bundled. Integrators install an adapter
-under the provider entry-point group and configure it through environment vars.
-"""
-from pathlib import Path
 
-from pattern_discovery import DB, import_ai_suggestions, selected_evidence, _connect
-from pattern_discovery_providers import ProviderConfig, load_provider
-
+_EVIDENCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "source_candidate_id": {"type": "string"},
+        "source_artifact_id": {"type": "integer"},
+        "exact_source_excerpt": {"type": "string"},
+    },
+    "required": ["source_candidate_id", "source_artifact_id", "exact_source_excerpt"],
+    "additionalProperties": False,
+}
 
 RESPONSE_SCHEMA = {
-    "proposals": [{
-        "candidate_name": "string",
-        "candidate_category": "company_brand|service_description|recurring_phrase|business_terminology|other",
-        "language": "BCP-47 language code or und",
-        "supporting_evidence": [{
-            "source_candidate_id": "exact selected evidence candidate ID",
-            "source_artifact_id": "integer source artifact ID",
-            "exact_source_excerpt": "verbatim substring of that source's raw evidence",
-        }],
-        "reasoning": "why this may be a reusable pattern, without asserting truth beyond evidence",
-        "confidence": "number from 0 to 1; uncalibrated estimate",
-        "confidence_basis": "what evidence supports this estimate and its limitations",
-        "novelty_type": "new_pattern|variant|possible_duplicate",
-        "target_pattern_id": "integer active approved pattern ID for variant/possible_duplicate; null for new_pattern",
-    }]
+    "type": "object",
+    "properties": {
+        "proposals": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "candidate_name": {"type": "string"},
+                    "candidate_category": {"type": "string", "enum": [
+                        "company_brand", "service_description", "recurring_phrase", "business_terminology", "other"
+                    ]},
+                    "language": {"type": "string"},
+                    "supporting_evidence": {"type": "array", "items": _EVIDENCE_SCHEMA},
+                    "reasoning": {"type": "string"},
+                    "confidence": {"type": "number"},
+                    "confidence_basis": {"type": "string"},
+                    "novelty_type": {"type": "string", "enum": ["new_pattern", "variant", "possible_duplicate"]},
+                    "target_pattern_id": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "suggested_category_key": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                },
+                "required": [
+                    "candidate_name", "candidate_category", "language", "supporting_evidence", "reasoning",
+                    "confidence", "confidence_basis", "novelty_type", "target_pattern_id", "description",
+                    "suggested_category_key",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["proposals"],
+    "additionalProperties": False,
 }
 
 
@@ -46,6 +69,7 @@ def build_ai_request(db_path=DB):
             "task": "Suggest reviewable reusable patterns. Never make approval or database changes.",
             "rules": [
                 "Use only the supplied selected evidence and active approved pattern library.",
+                "Look for potentially relevant new companies, brands, service descriptions, business terms, and recurring expressions.",
                 "Cite source_candidate_id and source_artifact_id and provide exact verbatim excerpts.",
                 "Do not invent IDs, quotations, names or facts. Do not infer fraud or intent.",
                 "Separate a new pattern from a variant or possible duplicate and cite target_pattern_id when applicable.",
@@ -76,15 +100,38 @@ def build_ai_request(db_path=DB):
 def run_ai_discovery(db_path=DB, provider=None, config=None, environ=None):
     """Call an explicitly configured/injected provider and persist validated suggestions."""
     config = config or ProviderConfig.from_environment(environ)
-    adapter = provider or load_provider(config, environ)
     request = build_ai_request(db_path)
-    response = adapter.generate(request)
-    if not isinstance(response, (dict, str)):
-        raise ValueError("provider response must be a JSON object or string")
-    if isinstance(response, str) and len(response.encode("utf-8")) > 2_000_000:
-        raise ValueError("provider response exceeds the 2 MB limit")
     metadata = {"provider": config.provider, "model": config.model}
-    return import_ai_suggestions(response, db_path, run_metadata=metadata)
+    conn = _connect(db_path)
+    run_id = _start_run(conn, len(request["selected_evidence"]), "ai_assisted")
+    conn.execute("UPDATE pattern_discovery_runs SET config_json=? WHERE run_id=?",
+        (json.dumps({"mode": "ai_assisted", "source": "current_selected_matching_input", **metadata}, sort_keys=True), run_id))
+    conn.commit()
+    conn.close()
+    try:
+        adapter = provider or load_provider(config, environ)
+        response = adapter.generate(request)
+        if not isinstance(response, (dict, str)):
+            raise ValueError("provider response must be a JSON object or string")
+        if isinstance(response, str) and len(response.encode("utf-8")) > 2_000_000:
+            raise ValueError("provider response exceeds the 2 MB limit")
+        result = import_ai_suggestions(response, db_path, run_metadata=metadata, existing_run_id=run_id)
+        return {**result, "provider": config.provider, "model": config.model}
+    except Exception as error:
+        conn = _connect(db_path)
+        if isinstance(error, ProviderRequestError):
+            safe_error = error.safe_message
+        elif isinstance(error, ProviderConfigurationError):
+            safe_error = str(error)[:300]
+        elif isinstance(error, ValueError):
+            safe_error = str(error)[:300]
+        else:
+            safe_error = type(error).__name__
+        conn.execute("UPDATE pattern_discovery_runs SET status='failed',error_text=?,completed_at=CURRENT_TIMESTAMP WHERE run_id=?",
+            (safe_error, run_id))
+        conn.commit()
+        conn.close()
+        raise
 
 
 __all__ = ["build_ai_request", "run_ai_discovery", "RESPONSE_SCHEMA"]

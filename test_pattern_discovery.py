@@ -3,13 +3,16 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 
 from evidence_processing import apply_migrations
 from pattern_discovery import export_ai_bundle, get_candidate, import_ai_suggestions, list_candidates, review_candidate, run_local_discovery
 from pattern_discovery import WORD_RE
 from pattern_discovery_ai import build_ai_request, run_ai_discovery
-from pattern_discovery_providers import ProviderConfig, ProviderConfigurationError, load_provider
+from pattern_discovery_providers import ProviderConfig, ProviderConfigurationError, ProviderRequestError, load_provider
+from pattern_discovery_openai import OpenAIResponsesProvider
 
 PROJECT=Path(__file__).resolve().parent
 
@@ -213,6 +216,95 @@ class PatternDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProviderConfigurationError,'unset'):
             from pattern_discovery_providers import resolve_api_key
             resolve_api_key(config,{})
+
+    def test_openai_adapter_sends_selected_evidence_and_structured_schema(self):
+        request_data={}
+        def opener(req,timeout):
+            request_data['url']=req.full_url
+            request_data['headers']=dict(req.header_items())
+            request_data['timeout']=timeout
+            request_data['payload']=json.loads(req.data.decode('utf-8'))
+            text=json.dumps(self.mock_response(build_ai_request(self.db)))
+            return BytesIO(json.dumps({'status':'completed','output_text':text}).encode('utf-8'))
+        config=ProviderConfig(provider='openai',model='test-model',timeout_seconds=7)
+        c=self.connect();pattern_count=c.execute('SELECT COUNT(*) FROM patterns').fetchone()[0];c.close()
+        provider=OpenAIResponsesProvider(config,environ={'OPENAI_API_KEY':'test-only-secret'},opener=opener)
+        result=run_ai_discovery(self.db,provider,config)
+        self.assertEqual(result['provider'],'openai')
+        self.assertEqual(result['model'],'test-model')
+        self.assertEqual(request_data['url'],'https://api.openai.com/v1/responses')
+        self.assertEqual(request_data['timeout'],7)
+        self.assertEqual(request_data['payload']['model'],'test-model')
+        self.assertFalse(request_data['payload']['store'])
+        self.assertEqual(request_data['payload']['text']['format']['type'],'json_schema')
+        sent=json.loads(request_data['payload']['input'][1]['content'][0]['text'])
+        expected=build_ai_request(self.db)
+        self.assertEqual(sent['selected_evidence'],expected['selected_evidence'])
+        self.assertEqual(sent['approved_pattern_library'],expected['approved_pattern_library'])
+        self.assertNotIn('test-only-secret',json.dumps(request_data['payload']))
+        c=self.connect()
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM pattern_discovery_candidates WHERE proposed_by='ai_assisted' AND discovery_status='pending_review'").fetchone()[0],1)
+        run_config=json.loads(c.execute('SELECT config_json FROM pattern_discovery_runs WHERE run_id=?',(result['run_id'],)).fetchone()[0])
+        self.assertEqual(run_config,{'mode':'ai_assisted','source':'current_selected_matching_input','provider':'openai','model':'test-model'})
+        self.assertEqual(c.execute('SELECT status FROM pattern_discovery_runs WHERE run_id=?',(result['run_id'],)).fetchone()[0],'completed')
+        self.assertEqual(c.execute('SELECT COUNT(*) FROM patterns').fetchone()[0],pattern_count)
+        c.close()
+
+    def test_openai_adapter_failures_are_audited_without_secret_or_response_body(self):
+        config=ProviderConfig(provider='openai',model='test-model')
+        def assert_failed(provider, expected_error):
+            with self.assertRaises(Exception):
+                run_ai_discovery(self.db,provider,config)
+            c=self.connect()
+            row=c.execute("SELECT status,error_text,config_json FROM pattern_discovery_runs ORDER BY rowid DESC LIMIT 1").fetchone()
+            self.assertEqual(row['status'],'failed')
+            self.assertIn(expected_error,row['error_text'])
+            self.assertNotIn('test-only-secret',row['error_text']+row['config_json'])
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM pattern_discovery_candidates WHERE proposed_by='ai_assisted'").fetchone()[0],0)
+            c.close()
+
+        invalid=self.mock_response(build_ai_request(self.db))
+        invalid['proposals'][0]['supporting_evidence'][0]['source_candidate_id']='fabricated'
+        assert_failed(type('BadCitationProvider',(),{'generate':lambda self,request: invalid})(),'outside current selected evidence')
+        assert_failed(type('MalformedProvider',(),{'generate':lambda self,request: '{not-json'})(),'valid JSON')
+        assert_failed(type('TimeoutProvider',(),{'generate':lambda self,request: (_ for _ in ()).throw(ProviderRequestError('OpenAI API request timed out'))})(),'timed out')
+        assert_failed(type('FailureProvider',(),{'generate':lambda self,request: (_ for _ in ()).throw(ProviderRequestError('OpenAI API returned HTTP 503'))})(),'HTTP 503')
+
+        malformed=OpenAIResponsesProvider(config,environ={'OPENAI_API_KEY':'test-only-secret'},
+            opener=lambda req,timeout: BytesIO(b'{malformed response'))
+        with self.assertRaisesRegex(ProviderRequestError,'malformed JSON'):
+            malformed.generate(build_ai_request(self.db))
+        timeout=OpenAIResponsesProvider(config,environ={'OPENAI_API_KEY':'test-only-secret'},
+            opener=lambda req,timeout: (_ for _ in ()).throw(TimeoutError()))
+        with self.assertRaisesRegex(ProviderRequestError,'timed out'):
+            timeout.generate(build_ai_request(self.db))
+        def failed_http(req,timeout):
+            raise HTTPError(req.full_url,503,'failure',{},BytesIO(b'test-only-secret body'))
+        http=OpenAIResponsesProvider(config,environ={'OPENAI_API_KEY':'test-only-secret'},opener=failed_http)
+        with self.assertRaisesRegex(ProviderRequestError,'HTTP 503') as raised:
+            http.generate(build_ai_request(self.db))
+        self.assertNotIn('test-only-secret',str(raised.exception))
+
+    def test_openai_requires_environment_key_and_fixed_key_variable(self):
+        config=ProviderConfig.from_environment({'SENTINEL_DISCOVERY_PROVIDER':'openai','SENTINEL_DISCOVERY_MODEL':'test-model'})
+        self.assertEqual(config.api_key_env,'OPENAI_API_KEY')
+        with self.assertRaisesRegex(ProviderConfigurationError,'OPENAI_API_KEY.*unset'):
+            load_provider(config,{})
+        with self.assertRaisesRegex(ProviderConfigurationError,'requires OPENAI_API_KEY'):
+            ProviderConfig.from_environment({'SENTINEL_DISCOVERY_PROVIDER':'openai','SENTINEL_DISCOVERY_MODEL':'test-model',
+                'SENTINEL_DISCOVERY_API_KEY_ENV':'OTHER_SECRET'})
+
+    def test_missing_openai_key_is_audited_without_attempting_inference(self):
+        config=ProviderConfig(provider='openai',model='test-model',api_key_env='OPENAI_API_KEY')
+        with self.assertRaisesRegex(ProviderConfigurationError,'OPENAI_API_KEY.*unset'):
+            run_ai_discovery(self.db,config=config,environ={})
+        c=self.connect()
+        run=c.execute('SELECT status,error_text,config_json FROM pattern_discovery_runs ORDER BY rowid DESC LIMIT 1').fetchone()
+        self.assertEqual(run['status'],'failed')
+        self.assertIn('OPENAI_API_KEY',run['error_text'])
+        self.assertNotIn('secret',run['config_json'].lower())
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM pattern_discovery_candidates WHERE proposed_by='ai_assisted'").fetchone()[0],0)
+        c.close()
 
     def test_offline_ai_bundle_contains_only_current_selected_evidence(self):
         target=Path(self.temp.name)/'bundle.json'

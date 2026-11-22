@@ -13,24 +13,30 @@ context.
   and request prompt for offline use. Import its response with
   `python pattern_discovery.py import-ai suggestions.json`.
 
-Sentinel ships no vendor adapter and does not assume credentials. An adapter
-must be installed as an entry point in the `sentinel.pattern_discovery_providers`
-group. Its factory receives `ProviderConfig` and returns an object implementing
-`generate(request)`. Tests use an injected mock and require no network or API
-credentials.
+Sentinel includes a provider-neutral adapter interface and an OpenAI Responses
+API adapter. Other providers can be installed as entry points in the
+`sentinel.pattern_discovery_providers` group. Tests use an injected mock and
+require no network or API credentials.
 
 Configure adapters with environment variables:
 
-- `SENTINEL_DISCOVERY_PROVIDER`: installed entry-point name; defaults to
-  `disabled`.
+- `SENTINEL_DISCOVERY_PROVIDER`: `openai`, another installed entry-point name,
+  or `disabled` (the default).
 - `SENTINEL_DISCOVERY_MODEL`: model identifier, required when enabled.
-- `SENTINEL_DISCOVERY_ENDPOINT`: optional provider endpoint.
-- `SENTINEL_DISCOVERY_API_KEY_ENV`: name of the environment variable holding
-  the provider secret. The secret value is never stored in the database or
-  included in the Sentinel evidence request. Adapters may resolve it with
-  `resolve_api_key` for provider authentication.
+- `OPENAI_API_KEY`: required by the OpenAI adapter. Keep the value in the
+  process environment or a secret manager; never place it in source, request
+  data, logs, or run metadata.
+- `SENTINEL_DISCOVERY_ENDPOINT`: optional endpoint for an adapter. The built-in
+  OpenAI adapter only accepts `https://api.openai.com/v1/responses`.
+- `SENTINEL_DISCOVERY_API_KEY_ENV`: secret-variable name for other adapters.
+  The OpenAI adapter fixes this to `OPENAI_API_KEY`.
 - `SENTINEL_DISCOVERY_TIMEOUT_SECONDS`: 1–600 seconds, defaults to 60; the
   adapter is responsible for enforcing the timeout.
+
+For OpenAI, configure `SENTINEL_DISCOVERY_PROVIDER=openai`, set
+`SENTINEL_DISCOVERY_MODEL` to a model available to the account, and provide
+`OPENAI_API_KEY` outside the repository. The adapter uses Responses API JSON
+Schema output and disables response storage. No default model is assumed.
 
 Every AI proposal must include a candidate name and supported discovery
 category, one or more evidence candidate/artifact IDs with exact source
@@ -46,7 +52,7 @@ duplicates cannot be approved; near-duplicate overrides require an explicit
 reviewer decision.
 
 The local miner finds repeated phrases and capitalized names as heuristic leads.
-It remains available when no AI adapter is configured. AI and heuristic
+It remains available when no AI provider is configured. AI and heuristic
 confidence values are uncalibrated and are not probabilities of correctness or
-risk. Actual provider execution remains unverified until an adapter is
-installed and configured.
+risk. Mocked tests do not verify live provider access; a real inference run
+requires the environment configuration above.
