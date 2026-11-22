@@ -6,8 +6,10 @@ import csv
 import io
 import re
 import subprocess
+import uuid
 
 from pathlib import Path
+from evidence_processing import process_database, begin_stage, finish_stage
 
 # ----------------------------------------
 # CONFIGURATION
@@ -22,6 +24,12 @@ PSM = "6"
 MIN_CONFIDENCE = 20
 
 MODEL_NAME = f"tesseract | {LANGUAGE} | psm{PSM} | conf{MIN_CONFIDENCE}"
+EXTRACTION_RUN_ID = str(uuid.uuid4())
+
+try:
+    SOFTWARE_VERSION = subprocess.run(["tesseract", "--version"], capture_output=True, text=True, check=True).stdout.splitlines()[0]
+except Exception:
+    SOFTWARE_VERSION = "unknown_not_recorded"
 
 # ----------------------------------------
 # HELPERS
@@ -127,6 +135,14 @@ def parse_tsv(tsv_data):
 connection = sqlite3.connect(DATABASE)
 connection.execute("PRAGMA foreign_keys = ON")
 cursor = connection.cursor()
+INGESTION_STAGE_ID = begin_stage(DATABASE, "ocr_ingestion", {
+    "extraction_run_id": EXTRACTION_RUN_ID,
+    "engine": "tesseract",
+    "model": MODEL_NAME,
+    "software_version": SOFTWARE_VERSION,
+    "language": LANGUAGE,
+    "configuration": {"psm": PSM, "minimum_confidence": MIN_CONFIDENCE},
+})
 
 # ----------------------------------------
 # SCHEMA MIGRATION
@@ -316,6 +332,8 @@ for frame_path in frame_paths:
     # ------------------------------------
 
     metadata = {
+        "extraction_run_id": EXTRACTION_RUN_ID,
+        "software_version": SOFTWARE_VERSION,
         "frame_number": frame_number,
         "language": LANGUAGE,
         "page_segmentation_mode": PSM,
@@ -399,4 +417,11 @@ print(f"Total transcript segments: {total_transcripts}")
 print("\nOCR data successfully imported into Sentinel!")
 
 connection.close()
+
+# Extraction records are committed first. A downstream failure is recorded by
+# the evidence stage runner and does not roll back or replace source OCR rows.
+print("\n--- EVIDENCE PROCESSING ---")
+result = process_database(DATABASE)
+finish_stage(DATABASE, INGESTION_STAGE_ID, {"saved": saved, "skipped": skipped, "empty": empty, "evidence_result": result})
+print(result)
 
