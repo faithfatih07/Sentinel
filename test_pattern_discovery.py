@@ -13,7 +13,7 @@ from unittest.mock import patch
 from evidence_processing import apply_migrations
 from pattern_discovery import export_ai_bundle, get_candidate, import_ai_suggestions, list_candidates, review_candidate, run_local_discovery
 from pattern_discovery import WORD_RE
-from pattern_discovery_ai import build_ai_request, run_ai_discovery
+from pattern_discovery_ai import build_ai_request, run_ai_discovery, _summarize_response
 from pattern_discovery_providers import ProviderConfig, ProviderConfigurationError, ProviderRequestError, load_provider
 from pattern_discovery_openai import OpenAIResponsesProvider
 from pattern_discovery_gemini import GeminiGenerateContentProvider
@@ -28,7 +28,11 @@ class PatternDiscoveryTests(unittest.TestCase):
         shutil.copy2(PROJECT/'sentinel.db',self.db)
         c=sqlite3.connect(self.db);c.execute('PRAGMA foreign_keys=ON');apply_migrations(c);c.close()
         c=sqlite3.connect(self.db);c.execute('PRAGMA foreign_keys=ON')
-        for table in ('pattern_discovery_candidate_evidence','pattern_discovery_candidate_runs','pattern_discovery_candidates','pattern_discovery_runs'):
+        # This is a disposable copy. Remove append-only guards only here so
+        # seed review rows can be cleared before each isolated test case.
+        c.execute('DROP TRIGGER IF EXISTS discovery_review_no_update')
+        c.execute('DROP TRIGGER IF EXISTS discovery_review_no_delete')
+        for table in ('pattern_discovery_reviews','pattern_discovery_candidate_evidence','pattern_discovery_candidate_runs','pattern_discovery_candidates','pattern_discovery_runs'):
             c.execute(f'DELETE FROM {table}')
         c.commit();c.close()
 
@@ -38,24 +42,28 @@ class PatternDiscoveryTests(unittest.TestCase):
     def connect(self):
         c=sqlite3.connect(self.db);c.row_factory=sqlite3.Row;c.execute('PRAGMA foreign_keys=ON');return c
 
-    def ai_suggestion(self,text='agricultural distribution advisory',language='en',candidate_type='service_description'):
+    def ai_suggestion(self,text=None,language='en',candidate_type='service_description'):
         c=self.connect()
         source=c.execute('SELECT candidate_id,source_artifact_id,original_text FROM current_selected_matching_input ORDER BY source_artifact_id LIMIT 1').fetchone()
         c.close()
         excerpt=source['original_text'].splitlines()[0]
+        text=text or excerpt
         return {'proposals':[{'candidate_name':text,'language':language,'candidate_category':candidate_type,
           'description':'Human-review test candidate','confidence':0.61,'confidence_basis':'one exact selected excerpt; low cross-source support',
           'reasoning':'The cited wording may describe a reusable service expression, but one source is insufficient to establish recurrence.',
           'novelty_type':'new_pattern','target_pattern_id':None,'suggested_category_key':'service',
           'supporting_evidence':[{'source_candidate_id':source['candidate_id'],'source_artifact_id':source['source_artifact_id'],'exact_source_excerpt':excerpt}]}]}
 
-    def mock_response(self, request, name='farm portfolio guidance'):
+    def mock_response(self, request, name=None):
         source=request['selected_evidence'][0]
+        span=source['citation_spans'][0]
+        name=name or span['exact_source_excerpt']
         return {'proposals':[{'candidate_name':name,'language':source['language'],'candidate_category':'service_description',
           'description':'Mocked provider suggestion','confidence':0.72,'confidence_basis':'One cited selected source; uncalibrated.',
           'reasoning':'Potentially reusable service wording; needs human review.', 'novelty_type':'new_pattern','target_pattern_id':None,
           'suggested_category_key':'service','supporting_evidence':[{'source_candidate_id':source['source_candidate_id'],
-            'source_artifact_id':source['source_artifact_id'],'exact_source_excerpt':source['raw_text'].splitlines()[0]}]}]}
+            'source_artifact_id':source['source_artifact_id'],'source_excerpt_id':span['source_excerpt_id'],
+            'exact_source_excerpt':None}]}]}
 
     def test_local_mining_uses_current_selection_and_does_not_publish(self):
         c=self.connect()
@@ -120,7 +128,12 @@ class PatternDiscoveryTests(unittest.TestCase):
         c.close()
 
     def test_exact_duplicate_is_flagged_and_cannot_be_approved(self):
-        result=import_ai_suggestions(self.ai_suggestion('investment advisory','en','recurring_phrase'),self.db)
+        suggestion=self.ai_suggestion()
+        c=self.connect()
+        c.execute('INSERT INTO patterns(canonical_name,description,is_active) VALUES (?,?,1)',
+            (suggestion['proposals'][0]['candidate_name'],'Fixture duplicate target'))
+        c.commit();c.close()
+        result=import_ai_suggestions(suggestion,self.db)
         c=self.connect();candidate=c.execute('SELECT candidate_id,discovery_status,duplicate_pattern_id FROM pattern_discovery_candidates').fetchone();before=c.execute('SELECT COUNT(*) FROM patterns').fetchone()[0];c.close()
         self.assertEqual(candidate['discovery_status'],'duplicate')
         self.assertIsNotNone(candidate['duplicate_pattern_id'])
@@ -139,6 +152,45 @@ class PatternDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'exactly occur'):
             import_ai_suggestions(suggestion,self.db)
 
+    def test_ai_import_resolves_span_id_and_rejects_fabricated_span(self):
+        request=build_ai_request(self.db)
+        source=request['selected_evidence'][0]
+        span=source['citation_spans'][0]
+        suggestion=self.mock_response(request)
+        result=import_ai_suggestions(suggestion,self.db)
+        self.assertEqual(result['imported'],1)
+        c=self.connect()
+        self.assertEqual(c.execute('SELECT evidence_excerpt FROM pattern_discovery_candidate_evidence').fetchone()[0],span['exact_source_excerpt'])
+        c.close()
+
+        suggestion=self.mock_response(build_ai_request(self.db),'fabricated span')
+        suggestion['proposals'][0]['supporting_evidence'][0]['source_excerpt_id']='s999'
+        with self.assertRaisesRegex(ValueError,'not present in the cited selected source'):
+            import_ai_suggestions(suggestion,self.db)
+
+    def test_ai_discovery_rejects_candidate_name_not_present_in_its_citations(self):
+        request=build_ai_request(self.db)
+        response=self.mock_response(request,'unsupported invented name')
+        class MockProvider:
+            def generate(self,unused): return response
+        result=run_ai_discovery(self.db,MockProvider(),ProviderConfig(provider='mock',model='fixture'))
+        self.assertEqual(result['response_summary']['proposal_count'],1)
+        self.assertEqual(result['rejected'],1)
+        self.assertEqual(result['imported'],0)
+        c=self.connect()
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM pattern_discovery_candidates WHERE proposed_by='ai_assisted'").fetchone()[0],0)
+        summary=json.loads(c.execute('SELECT config_json FROM pattern_discovery_runs WHERE run_id=?',(result['run_id'],)).fetchone()[0])['response_summary']
+        self.assertEqual(summary['unsupported_name_rejections'],1)
+        c.close()
+
+    def test_citation_spans_are_stable_and_exact(self):
+        from pattern_discovery import citation_spans
+        raw='Title | second line. Third sentence!'
+        spans=citation_spans(raw)
+        self.assertEqual(spans,citation_spans(raw))
+        self.assertEqual([span['source_excerpt_id'] for span in spans],['s001','s002','s003'])
+        self.assertTrue(all(span['exact_source_excerpt'] in raw for span in spans))
+
     def test_provider_request_is_selected_evidence_and_active_library_only(self):
         request=build_ai_request(self.db)
         c=self.connect()
@@ -149,6 +201,50 @@ class PatternDiscoveryTests(unittest.TestCase):
         self.assertEqual({r['id'] for r in request['approved_pattern_library']},active)
         self.assertNotIn('previous_proposals',request)
         self.assertNotIn('api_key',request)
+        guidance=' '.join(request['rules']).lower()
+        self.assertIn('do not require recurrence',guidance)
+        self.assertIn('at least two distinct source artifacts',guidance)
+        self.assertIn('channel or program titles',guidance)
+        self.assertIn("keep the candidate in its source language",guidance)
+        self.assertIn('choose a supplied source_excerpt_id',guidance)
+        self.assertIn('span that contains the candidate_name itself',guidance)
+        self.assertIn('only after checking all supplied evidence',guidance)
+        for source in request['selected_evidence']:
+            self.assertTrue(source['citation_spans'])
+            self.assertTrue(all(span['exact_source_excerpt'] in source['raw_text'] for span in source['citation_spans']))
+
+    def test_response_audit_summary_excludes_candidate_text_and_citations(self):
+        response={'proposals':[{'candidate_name':'private phrase','candidate_category':'service_description',
+            'supporting_evidence':[{'source_candidate_id':'candidate-secret','source_artifact_id':123,
+                                    'exact_source_excerpt':'private evidence excerpt'}]}]}
+        summary=_summarize_response(response)
+        self.assertEqual(summary['parse_status'],'valid_json')
+        self.assertEqual(summary['proposal_count'],1)
+        self.assertEqual(summary['proposal_categories'],{'service_description':1})
+        self.assertEqual(summary['citation_count'],1)
+        self.assertNotIn('candidate_name',summary)
+        self.assertNotIn('candidate-secret',json.dumps(summary))
+        self.assertNotIn('private evidence excerpt',json.dumps(summary))
+
+    def test_recurring_phrase_requires_two_distinct_artifact_citations(self):
+        suggestion=self.ai_suggestion(None,'en','recurring_phrase')
+        with self.assertRaisesRegex(ValueError,'at least two distinct source artifacts'):
+            import_ai_suggestions(suggestion,self.db)
+        c=self.connect()
+        sources=c.execute('SELECT candidate_id,source_artifact_id,original_text FROM current_selected_matching_input ORDER BY source_artifact_id LIMIT 2').fetchall()
+        c.close()
+        self.assertEqual(len(sources),2)
+        proposal=suggestion['proposals'][0]
+        proposal['supporting_evidence']=[{
+            'source_candidate_id':source['candidate_id'],
+            'source_artifact_id':source['source_artifact_id'],
+            'exact_source_excerpt':source['original_text'].splitlines()[0],
+        } for source in sources]
+        result=import_ai_suggestions(suggestion,self.db)
+        self.assertEqual(result['imported'],1)
+        candidate=list_candidates(self.db,'pending_review')[0]
+        self.assertEqual(candidate['candidate_type'],'recurring_phrase')
+        self.assertEqual(len(candidate['evidence']),2)
 
     def test_mock_provider_suggestion_persists_separately_without_approval(self):
         class MockProvider:
@@ -169,6 +265,9 @@ class PatternDiscoveryTests(unittest.TestCase):
         run_config=json.loads(c.execute('SELECT config_json FROM pattern_discovery_runs ORDER BY rowid DESC LIMIT 1').fetchone()[0])
         self.assertEqual(run_config['provider'],'mock')
         self.assertEqual(run_config['model'],'fixture')
+        self.assertEqual(run_config['response_summary']['proposal_count'],1)
+        self.assertEqual(run_config['response_summary']['proposal_categories'],{'service_description':1})
+        self.assertNotIn('candidate_name',json.dumps(run_config))
         self.assertNotIn('api_key',run_config)
         self.assertNotIn('secret',json.dumps(run_config).lower())
         self.assertEqual(result['imported'],1)
@@ -177,6 +276,8 @@ class PatternDiscoveryTests(unittest.TestCase):
         self.assertEqual(c.execute('SELECT COUNT(*) FROM pattern_discovery_candidate_runs').fetchone()[0],2)
         self.assertIsNotNone(provider.request)
         self.assertEqual(c.execute('SELECT COUNT(*) FROM pattern_discovery_candidate_evidence').fetchone()[0],1)
+        expected_excerpt=provider.request['selected_evidence'][0]['citation_spans'][0]['exact_source_excerpt']
+        self.assertEqual(c.execute('SELECT evidence_excerpt FROM pattern_discovery_candidate_evidence').fetchone()[0],expected_excerpt)
         c.close()
 
     def test_ai_response_requires_all_fields_and_valid_target(self):
@@ -195,7 +296,7 @@ class PatternDiscoveryTests(unittest.TestCase):
             import_ai_suggestions(suggestion,self.db)
 
     def test_variant_requires_human_approval_and_adds_to_target_pattern(self):
-        suggestion=self.ai_suggestion('specialized rural portfolio planning','en','service_description')
+        suggestion=self.ai_suggestion(None,'en','service_description')
         c=self.connect();target=c.execute('SELECT id FROM patterns WHERE is_active=1 ORDER BY id LIMIT 1').fetchone()[0]
         pattern_count=c.execute('SELECT COUNT(*) FROM patterns').fetchone()[0]
         variant_count=c.execute('SELECT COUNT(*) FROM pattern_variants WHERE pattern_id=?',(target,)).fetchone()[0];c.close()
@@ -241,6 +342,9 @@ class PatternDiscoveryTests(unittest.TestCase):
         self.assertEqual(request_data['payload']['model'],'test-model')
         self.assertFalse(request_data['payload']['store'])
         self.assertEqual(request_data['payload']['text']['format']['type'],'json_schema')
+        system_prompt=request_data['payload']['input'][0]['content'][0]['text']
+        self.assertIn('source_excerpt_id',system_prompt)
+        self.assertIn('contains candidate_name itself',system_prompt)
         sent=json.loads(request_data['payload']['input'][1]['content'][0]['text'])
         expected=build_ai_request(self.db)
         self.assertEqual(sent['selected_evidence'],expected['selected_evidence'])
@@ -249,7 +353,9 @@ class PatternDiscoveryTests(unittest.TestCase):
         c=self.connect()
         self.assertEqual(c.execute("SELECT COUNT(*) FROM pattern_discovery_candidates WHERE proposed_by='ai_assisted' AND discovery_status='pending_review'").fetchone()[0],1)
         run_config=json.loads(c.execute('SELECT config_json FROM pattern_discovery_runs WHERE run_id=?',(result['run_id'],)).fetchone()[0])
-        self.assertEqual(run_config,{'mode':'ai_assisted','source':'current_selected_matching_input','provider':'openai','model':'test-model'})
+        self.assertEqual({k:run_config[k] for k in ('mode','source','provider','model')},
+            {'mode':'ai_assisted','source':'current_selected_matching_input','provider':'openai','model':'test-model'})
+        self.assertEqual(run_config['response_summary']['proposal_count'],1)
         self.assertEqual(c.execute('SELECT status FROM pattern_discovery_runs WHERE run_id=?',(result['run_id'],)).fetchone()[0],'completed')
         self.assertEqual(c.execute('SELECT COUNT(*) FROM patterns').fetchone()[0],pattern_count)
         c.close()
@@ -329,6 +435,10 @@ class PatternDiscoveryTests(unittest.TestCase):
         payload=json.loads(request_data[1][0].data.decode('utf-8'))
         self.assertEqual(payload['generationConfig']['responseMimeType'],'application/json')
         self.assertEqual(payload['generationConfig']['responseJsonSchema'],build_ai_request(self.db)['response_schema'])
+        system_prompt=payload['systemInstruction']['parts'][0]['text']
+        self.assertIn('A clear single source is enough',system_prompt)
+        self.assertIn('channel or program titles',system_prompt)
+        self.assertIn('complete scan finds no source-supported candidate',system_prompt)
         sent=json.loads(payload['contents'][0]['parts'][0]['text'])
         expected=build_ai_request(self.db)
         self.assertEqual(sent['selected_evidence'],expected['selected_evidence'])

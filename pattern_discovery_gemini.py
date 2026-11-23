@@ -150,13 +150,26 @@ class GeminiGenerateContentProvider:
         prompt = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
         payload = {
             "systemInstruction": {"parts": [{"text": (
-                "You are Sentinel's pattern-discovery assistant. Identify potential new companies, brands, "
-                "services, business terminology, and recurring expressions from only the supplied current "
-                "selected evidence and active approved Pattern Library. Every proposal must cite exact source "
-                "candidate and artifact IDs and a verbatim excerpt. Never invent a source, quotation, or fact. "
-                "Do not infer fraud or intent. Explain reasoning and confidence basis, and classify novelty as "
-                "new_pattern, variant, or possible_duplicate. Return an empty proposals list when evidence is "
-                "insufficient. Suggestions are for human review only."
+                "You are Sentinel's pattern-discovery assistant. Carefully inspect every supplied current selected "
+                "evidence item and the active approved Pattern Library. Surface potentially useful companies or "
+                "brands, publishers, channel or program titles, products, concrete services or offers, business "
+                "terminology, distinctive claims or slogans, and "
+                "recurring expressions as candidates for human review; discovery candidates need not already be "
+                "proven or recurrent. A clear single source is enough to propose a company_brand, "
+                "service_description, or business_terminology candidate, with confidence reflecting the limited "
+                "support. Only classify wording as recurring_phrase when it appears in at least two distinct source "
+                "artifacts. A repeated channel, publisher, or program title may be a brand lead, but do not infer "
+                "legal company status or treat a person name alone as an organization. Respect the source language; "
+                "use normalized_text to notice wording but keep candidate names in the original language. "
+                "Treat the active library as a comparison aid: do not omit a supported related phrase; "
+                "classify it as a variant or possible duplicate and cite its active target. For each citation, select "
+                "one source_excerpt_id from the cited evidence item's citation_spans. Return exact_source_excerpt "
+                "as null; Sentinel resolves the exact immutable source text from that span ID. Do not invent or alter "
+                "span IDs. Select a span that contains candidate_name itself; do not infer names from uncited context "
+                "or paraphrase them. Every proposal must cite real source candidate and artifact IDs and a supplied span ID. Never "
+                "invent names, sources, quotations, or facts, and do not infer fraud or intent. Explain the basis "
+                "and uncertainty of the suggestion. Return an empty proposals list only if a complete scan finds no "
+                "source-supported candidate that could reasonably merit human review. Suggestions are not approvals."
             )}]},
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {

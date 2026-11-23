@@ -52,11 +52,15 @@ source citations are independently validated against Sentinel's database
 before any pending-review record is written.
 
 Every AI proposal must include a candidate name and supported discovery
-category, one or more evidence candidate/artifact IDs with exact source
-excerpts, reasoning, confidence and its basis, and novelty type (`new_pattern`,
-`variant`, or `possible_duplicate`). Variants and possible duplicates must cite
-an active approved target pattern. The importer validates all citations and
-quotes against actual current selected raw evidence before persistence.
+category, one or more evidence candidate/artifact IDs, reasoning, confidence
+and its basis, and novelty type (`new_pattern`, `variant`, or
+`possible_duplicate`). Gemini and OpenAI receive deterministic
+`source_excerpt_id` spans derived from selected raw text and return span IDs
+instead of retyping noisy OCR. Sentinel resolves each ID to its exact immutable
+source substring, checks that the candidate name occurs in a cited excerpt,
+and rejects fabricated or stale citations before persistence. Variants and
+possible duplicates must cite an active approved target pattern. Legacy imports
+with exact quotations remain supported.
 
 Suggestions are stored in discovery candidate tables, separate from approved
 patterns. There is no automatic approval path. Only explicit human review may

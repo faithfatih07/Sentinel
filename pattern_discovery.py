@@ -32,6 +32,29 @@ def normalize_phrase(value):
     return " ".join(WORD_RE.findall(value))
 
 
+def citation_spans(raw_text):
+    """Return stable, exact substrings that a model can cite by span ID.
+
+    Splits only at hard visual/transcript boundaries. The returned text is
+    always copied from raw_text; callers persist that authoritative substring
+    instead of trusting a model to reproduce noisy OCR character-for-character.
+    """
+    raw_text = raw_text or ""
+    spans = []
+    start = 0
+    for boundary in re.finditer(r"\n+|\|+|(?<=[.!?;])\s+", raw_text):
+        excerpt = raw_text[start:boundary.start()].strip()
+        if excerpt:
+            spans.append({"source_excerpt_id": f"s{len(spans) + 1:03d}", "exact_source_excerpt": excerpt})
+        start = boundary.end()
+    excerpt = raw_text[start:].strip()
+    if excerpt:
+        spans.append({"source_excerpt_id": f"s{len(spans) + 1:03d}", "exact_source_excerpt": excerpt})
+    if not spans and raw_text.strip():
+        spans.append({"source_excerpt_id": "s001", "exact_source_excerpt": raw_text.strip()})
+    return spans
+
+
 def _language(value):
     value = (value or "und").strip().lower().replace("_", "-")
     if "+" in value or "," in value:
@@ -410,10 +433,27 @@ def import_ai_suggestions(suggestions, db_path=DB, run_metadata=None, existing_r
                 source=active.get(source_id)
                 if isinstance(artifact_id,bool) or not isinstance(artifact_id,int) or not source or source["source_artifact_id"]!=artifact_id:
                     raise ValueError("AI proposal references evidence outside current selected evidence")
+                span_id=item.get("source_excerpt_id")
                 excerpt=item.get("exact_source_excerpt")
-                if not isinstance(excerpt,str) or not excerpt or excerpt not in (source["original_text"] or ""):
+                if span_id is not None:
+                    if not isinstance(span_id,str) or not span_id:
+                        raise ValueError("source_excerpt_id must identify a supplied exact source span")
+                    span=next((s for s in citation_spans(source["original_text"]) if s["source_excerpt_id"]==span_id),None)
+                    if not span:
+                        raise ValueError("source_excerpt_id is not present in the cited selected source")
+                    if excerpt not in (None,span["exact_source_excerpt"]):
+                        raise ValueError("exact_source_excerpt does not match the selected source span")
+                    excerpt=span["exact_source_excerpt"]
+                elif not isinstance(excerpt,str) or not excerpt or excerpt not in (source["original_text"] or ""):
+                    # Accept older provider-neutral/imported responses while newer
+                    # adapters use server-resolved span IDs for noisy OCR text.
                     raise ValueError("exact_source_excerpt must exactly occur in the cited selected source")
-                checked.append({"source_candidate_id":source["candidate_id"],"source_artifact_id":source["source_artifact_id"],"evidence_excerpt":excerpt})
+                checked.append({"source_candidate_id":source["candidate_id"],"source_artifact_id":source["source_artifact_id"],"source_excerpt_id":span_id,"evidence_excerpt":excerpt})
+            if category=="recurring_phrase" and len({item["source_artifact_id"] for item in checked})<2:
+                raise ValueError("recurring_phrase suggestions need citations from at least two distinct source artifacts")
+            normalized_name=normalize_phrase(name)
+            if not normalized_name or not any(normalized_name in normalize_phrase(item["evidence_excerpt"]) for item in checked):
+                raise ValueError("candidate_name must appear in at least one cited exact source excerpt")
             validated.append({**proposal,"candidate_name":name.strip(),"candidate_category":category,
                 "supporting_evidence":checked,"confidence":float(confidence),"target_pattern_id":target})
     except Exception:
@@ -431,6 +471,24 @@ def import_ai_suggestions(suggestions, db_path=DB, run_metadata=None, existing_r
         metadata={"provider":"offline_import","model":None}
         if isinstance(run_metadata,dict):
             metadata.update({k:v for k,v in run_metadata.items() if k in ("provider","model","endpoint") and isinstance(v,(str,type(None)))})
+            summary=run_metadata.get("response_summary")
+            if isinstance(summary,dict):
+                safe_summary={}
+                for key in ("parse_status","response_sha256"):
+                    value=summary.get(key)
+                    if isinstance(value,str): safe_summary[key]=value[:100]
+                keys=summary.get("top_level_keys")
+                if isinstance(keys,list): safe_summary["top_level_keys"]=[x[:100] for x in keys if isinstance(x,str)][:30]
+                for key in ("proposal_count","unsupported_name_rejections"):
+                    count=summary.get(key)
+                    if isinstance(count,int) and not isinstance(count,bool): safe_summary[key]=count
+                citation_count=summary.get("citation_count")
+                if isinstance(citation_count,int) and not isinstance(citation_count,bool): safe_summary["citation_count"]=citation_count
+                categories=summary.get("proposal_categories")
+                if isinstance(categories,dict):
+                    safe_summary["proposal_categories"]={k[:100]:v for k,v in categories.items()
+                        if isinstance(k,str) and isinstance(v,int) and not isinstance(v,bool)}
+                metadata["response_summary"]=safe_summary
         conn.execute("UPDATE pattern_discovery_runs SET config_json=? WHERE run_id=?",
             (json.dumps({"mode":"ai_assisted","source":"current_selected_matching_input",**metadata},sort_keys=True),run_id))
         conn.commit()
